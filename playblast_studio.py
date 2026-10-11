@@ -150,6 +150,13 @@ VIDEO_EXTENSIONS = (
     '.mov', '.mp4', '.avi', '.ogv', '.ogg', '.mkv', '.webm', '.mpg', '.mpeg',
     '.dv', '.flv',
 )
+# First extension Blender accepts per FFmpeg container.  A movie path that
+# already ends in one of these is used VERBATIM; without it Blender appends
+# the frame range ('clip0001-0250.mp4').
+CONTAINER_EXTENSIONS = {
+    'MPEG4': '.mp4', 'QUICKTIME': '.mov', 'AVI': '.avi',
+    'OGG': '.ogv', 'MKV': '.mkv', 'WEBM': '.webm',
+}
 IMAGE_EXTENSIONS = (
     '.png', '.jpg', '.jpeg', '.jp2', '.j2k', '.cin', '.dpx', '.bmp', '.tga',
     '.tif', '.tiff', '.exr', '.webp', '.avif', '.rgb', '.hdr',
@@ -167,6 +174,17 @@ def sanitize_filename(name):
     """Removes characters that would make the file unwritable on some OS."""
     name = _ILLEGAL_NAME_CHARS.sub("_", str(name or "").strip())
     return name.rstrip(". ")
+
+
+def movie_filepath(render, base_path):
+    """
+    `base_path` + the extension of the container Blender will really use
+    (read after the format is applied, so fallbacks are honoured).  Handing
+    this to `render.filepath` gives a clean 'name.mp4' instead of Blender's
+    'name0000-0042.mp4'.
+    """
+    container = get_attr_safe(get_attr_safe(render, "ffmpeg"), "format")
+    return base_path + CONTAINER_EXTENSIONS.get(container, ".mp4")
 
 
 def strip_redundant_extension(name, is_video):
@@ -223,25 +241,26 @@ def find_output_files(base_path, is_video):
     """
     Files Blender actually wrote for `base_path` (which has no extension).
     Used to confirm a playblast succeeded and to report the real file name.
+    Movies: 'name.mp4' (a legacy 'name0000-0042.mp4' is accepted too).
+    Sequences: 'name<frame>.<ext>'.
     """
     directory = os.path.dirname(base_path) or "."
     stem = os.path.basename(base_path)
-    if not stem or not os.path.isdir(directory):
+    try:
+        entries = os.listdir(directory) if stem else []
+    except OSError:
         return []
 
-    pattern = os.path.join(directory, stem + (".*" if is_video else "*.*"))
-    try:
-        matches = [p for p in glob.glob(pattern) if os.path.isfile(p)]
-    except Exception:
-        matches = []
-
     if is_video:
-        movies = [p for p in matches
-                  if os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS]
-        if movies:
-            matches = movies
-    return sorted(matches,
-                  key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+        movie = re.compile(r'^%s(?:\d{4,}-\d{4,})?(\.[^.]+)$' % re.escape(stem))
+        names = [e for e in entries if movie.match(e)
+                 and movie.match(e).group(1).lower() in VIDEO_EXTENSIONS]
+    else:
+        names = [e for e in entries if e.startswith(stem) and "." in e[len(stem):]]
+
+    paths = [os.path.join(directory, n) for n in names]
+    paths = [p for p in paths if os.path.isfile(p)]
+    return sorted(paths, key=os.path.getmtime)
 
 
 # =========================================================================
@@ -312,11 +331,12 @@ def scan_existing_versions(directory, base_stem):
 
     A version is always terminated by an underscore (sequences:
     'clip_v001_0001.png'), a dot (movies: 'clip_v001.mp4') or the end of the
-    name, so any digit count parses cleanly: v100, v1000, v12345.
+    name, so any digit count parses cleanly: v100, v1000, v12345.  Movies
+    from older versions ('clip_v0010000-0042.mp4') are counted as well.
     """
     if not directory or not os.path.isdir(directory):
         return 0
-    pattern = re.compile(r'^%s_v(\d+)(?:_|\.|$)'
+    pattern = re.compile(r'^%s_v(\d+)(?:_|\.|$|\d{4,}-\d{4,}\.)'
                          % re.escape(base_stem.rstrip('_')))
     highest = 0
     try:
@@ -2190,11 +2210,13 @@ class PlayblastJob:
         render = self.render
         render.use_overwrite = True
         render.use_file_extension = True
-        render.filepath = self.target_path
         ok, message = apply_output_format(render, self.settings, self.want_video)
         if not ok:
             report(self.op, 'ERROR', message)
-        return ok
+            return False
+        render.filepath = (movie_filepath(render, self.target_path)
+                           if self.want_video else self.target_path)
+        return True
 
     def _prepare_stamps(self):
         width, height, percentage = self.note_size
@@ -2346,7 +2368,6 @@ def play_output(context, operator, base_path, is_video, container, image_encodin
     try:
         # play_rendered_anim reads render.filepath and the format at call time.
         render.use_file_extension = True
-        render.filepath = base_path
 
         if is_video:
             assign_enum(image_settings, "media_type", ['VIDEO'])
@@ -2358,6 +2379,7 @@ def play_output(context, operator, base_path, is_video, container, image_encodin
             assign_enum(image_settings, "media_type", ['IMAGE'])
             assign_enum(image_settings, "file_format", [image_encoding or 'PNG', 'PNG'])
 
+        render.filepath = movie_filepath(render, base_path) if is_video else base_path
         res = normalize_operator_result(bpy.ops.render.play_rendered_anim())
         if 'CANCELLED' in res:
             report(operator, 'ERROR',
@@ -2683,7 +2705,7 @@ class PLAYBLAST_MT_presets(Menu):
 
 
 # =========================================================================
-#  Sidebar panel (three buttons, nothing else)
+#  Sidebar panel 
 # =========================================================================
 
 class PlayblastMainPanel(Panel):
