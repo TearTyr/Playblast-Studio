@@ -285,7 +285,10 @@ def get_user_name():
         return os.environ.get("USER") or os.environ.get("USERNAME") or "user"
 
 
-def expand_name_tokens(template, scene, settings):
+_WILD = '\ue000'  # stands for 'any number' when scanning for versions
+
+
+def expand_name_tokens(template, scene, settings, wild=False):
     """
     Replaces {tokens} in the output file name.
 
@@ -310,9 +313,11 @@ def expand_name_tokens(template, scene, settings):
         'date': time.strftime("%Y-%m-%d"),
         'time': time.strftime("%H%M%S"),
         'datetime': time.strftime("%Y%m%d_%H%M%S"),
-        'start': str(start),
-        'end': str(end),
-        'frames': str(frame_count(start, end, step)),
+        # With wild=True the range tokens match ANY range, so a changed frame
+        # range no longer restarts the version count at v001.
+        'start': _WILD if wild else str(start),
+        'end': _WILD if wild else str(end),
+        'frames': _WILD if wild else str(frame_count(start, end, step)),
         'fps': "%g" % scene_fps(scene),
         'res': "%dx%d" % (int(render.resolution_x), int(render.resolution_y)),
     }
@@ -336,8 +341,8 @@ def scan_existing_versions(directory, base_stem):
     """
     if not directory or not os.path.isdir(directory):
         return 0
-    pattern = re.compile(r'^%s_v(\d+)(?:_|\.|$|\d{4,}-\d{4,}\.)'
-                         % re.escape(base_stem.rstrip('_')))
+    prefix = re.escape(base_stem.rstrip('_')).replace(_WILD, r'-?\d+')
+    pattern = re.compile(r'^%s_v(\d+)(?:_|\.|$|\d{4,}-\d{4,}\.)' % prefix)
     highest = 0
     try:
         for entry in os.listdir(directory):
@@ -378,14 +383,14 @@ def _output_directory(settings):
     return os.path.expanduser(base)
 
 
-def _output_stem(settings, scene, version=0):
+def _output_stem(settings, scene, version=0, wild=False):
     """File name without folder or extension, versioned when asked."""
     if not settings.saveOutputToFile:
         return "playblast_temp_"
     is_video = output_is_video(settings)
     name = settings.outputFileName or "playblast"
     if settings.useNameTokens and scene is not None:
-        name = expand_name_tokens(name, scene, settings)
+        name = expand_name_tokens(name, scene, settings, wild)
     # A leading separator would make os.path.join discard the output folder.
     name = sanitize_filename(name).lstrip("/\\")
     name = strip_redundant_extension(name, is_video) or "playblast"
@@ -397,13 +402,13 @@ def _output_stem(settings, scene, version=0):
     return name if is_video else name + "_"
 
 
-def resolve_render_filepath(settings, scene=None, version=0):
+def resolve_render_filepath(settings, scene=None, version=0, wild=False):
     """
     Absolute output path WITHOUT extension (Blender appends it).  Touches no
     files, so it is safe to call while drawing.  `outputFilePath` is always a
     folder; the file name may contain sub-folders.
     """
-    stem = _output_stem(settings, _scene_or_current(scene), version)
+    stem = _output_stem(settings, _scene_or_current(scene), version, wild)
     return os.path.join(_output_directory(settings), stem)
 
 
@@ -417,7 +422,8 @@ def resolve_output_path(settings, scene=None, create_dirs=True):
     version = 0
     if settings.saveOutputToFile and settings.autoVersion:
         # Sequences end in '_' and a template may itself end in '_v005'.
-        stem = base_stem_of(os.path.basename(path).rstrip('_'))
+        wild_path = resolve_render_filepath(settings, scene, wild=True)
+        stem = base_stem_of(os.path.basename(wild_path).rstrip('_'))
         version = scan_existing_versions(os.path.dirname(path), stem) + 1
         path = resolve_render_filepath(settings, scene, version)
     directory = os.path.dirname(path)
@@ -944,14 +950,21 @@ def apply_stamp_settings(render, settings, note_text):
     if hasattr(render, 'stamp_note_text'):
         set_attr_safe(render, 'stamp_note_text', note_text)
 
+    # Font size always applies; Blender's default (12 px) is unreadable at HD+.
+    if hasattr(render, 'stamp_font_size'):
+        try:
+            if settings.stampAutoSize:
+                height = render.resolution_y * render.resolution_percentage / 100.0
+                size = height / 45.0          # ~24 px at 1080p
+            else:
+                size = settings.stampFontSize
+            render.stamp_font_size = int(max(8, min(200, size)))
+        except Exception:
+            pass
+
     if settings.useStampStyle:
         if hasattr(render, 'use_stamp_labels'):
             set_attr_safe(render, 'use_stamp_labels', bool(settings.stampUseLabels))
-        if hasattr(render, 'stamp_font_size'):
-            try:
-                render.stamp_font_size = int(max(8, min(64, settings.stampFontSize)))
-            except Exception:
-                pass
         if hasattr(render, 'stamp_foreground'):
             set_attr_safe(render, 'stamp_foreground', list(settings.stampFgColor))
         if hasattr(render, 'stamp_background'):
@@ -1664,7 +1677,10 @@ class PlayblastSettingsGroup(PropertyGroup):
         name="Custom Stamp Style",
         description="Override the stamp font size, colours and labels for this playblast",
         default=False)
-    stampFontSize: IntProperty(name="Font Size", default=12, min=8, max=64)
+    stampAutoSize: BoolProperty(
+        name="Auto Font Size", default=True,
+        description="Scale the stamp text with the render height so it stays readable")
+    stampFontSize: IntProperty(name="Font Size", default=24, min=8, max=200)
     stampUseLabels: BoolProperty(name="Show Labels", default=True,
                                  description="Prefix values with their label ('Camera: ...')")
     stampFgColor: FloatVectorProperty(name="Text Color", subtype='COLOR', size=4,
@@ -1966,9 +1982,11 @@ def _section_stamps(layout, owner):
     col.prop(owner, "metadata_camera_name")
     col.prop(owner, "metadata_camera_lens")
     layout.prop(owner, "extraInfo", text="Note")
+    layout.prop(owner, "stampAutoSize")
+    if not owner.stampAutoSize:
+        layout.prop(owner, "stampFontSize")
     layout.prop(owner, "useStampStyle")
     if owner.useStampStyle:
-        layout.prop(owner, "stampFontSize")
         layout.prop(owner, "stampUseLabels")
         layout.prop(owner, "stampFgColor", text="Text")
         layout.prop(owner, "stampBgColor", text="Background")
@@ -2705,7 +2723,7 @@ class PLAYBLAST_MT_presets(Menu):
 
 
 # =========================================================================
-#  Sidebar panel 
+#  Sidebar panel (three buttons, nothing else)
 # =========================================================================
 
 class PlayblastMainPanel(Panel):
