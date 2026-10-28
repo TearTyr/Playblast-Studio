@@ -1,15 +1,14 @@
 bl_info = {
     "name": "Playblast Animation Plugin",
-    "author": "Meri and Someone Else",
-    "version": (4, 3, 0),
+    "author": "TearTyr",
+    "version": (4, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Playblast",
     "description": (
         "Studio-style viewport playblasts: one-click review renders with custom "
         "resolutions, codecs, audio, burn-in stamps, naming tokens, versioning, "
         "presets and viewport display control. Settings live in the Adjust Last "
-        "Operation panel (viewport bottom-left). Verified against Blender 4.0 "
-        "through 5.2 LTS."
+        "Operation panel (viewport bottom-left). Targets Blender 4.0 and newer."
     ),
     "warning": "",
     "doc_url": "",
@@ -17,7 +16,6 @@ bl_info = {
 }
 
 import bpy
-import glob
 import json
 import logging
 import os
@@ -130,7 +128,10 @@ def set_attr_safe(rna_owner, prop_name, value):
     try:
         setattr(rna_owner, prop_name, value)
         return True
-    except Exception:
+    except Exception as exc:
+        # Silent failures hid the rv3d.persp bug for a whole release: leave a
+        # trace at debug level so 'why did nothing happen' is answerable.
+        LOG.debug("Cannot set %s: %s", prop_name, exc)
         return False
 
 
@@ -156,6 +157,12 @@ VIDEO_EXTENSIONS = (
 CONTAINER_EXTENSIONS = {
     'MPEG4': '.mp4', 'QUICKTIME': '.mov', 'AVI': '.avi',
     'OGG': '.ogv', 'MKV': '.mkv', 'WEBM': '.webm',
+}
+# Extension Blender writes per image format (used for the live name preview).
+IMAGE_FORMAT_EXTENSIONS = {
+    'PNG': '.png', 'JPEG': '.jpg', 'JPEG2000': '.jp2', 'OPEN_EXR': '.exr',
+    'CINEON': '.cin', 'DPX': '.dpx', 'BMP': '.bmp', 'TARGA': '.tga',
+    'TIFF': '.tif',
 }
 IMAGE_EXTENSIONS = (
     '.png', '.jpg', '.jpeg', '.jp2', '.j2k', '.cin', '.dpx', '.bmp', '.tga',
@@ -371,7 +378,13 @@ def _scene_or_current(scene):
 
 
 def _output_directory(settings):
-    """Absolute output folder. '//' paths need a saved .blend, else temp."""
+    """
+    Absolute output folder.  With 'Save to File' off the output is a throwaway
+    sequence and always goes to the temp dir.  '//' paths need a saved .blend,
+    else temp.
+    """
+    if not settings.saveOutputToFile:
+        return get_default_temp_dir() or os.getcwd()
     base = (settings.outputFilePath or "").strip() or get_default_temp_dir()
     if base.startswith("//") and not bpy.data.is_saved:
         base = get_default_temp_dir()
@@ -433,6 +446,22 @@ def resolve_output_path(settings, scene=None, create_dirs=True):
         except OSError:
             pass
     return path, version
+
+
+def preview_filename(settings, scene):
+    """
+    Name of the file the next playblast will write, for the settings panel.
+    I/O-free (safe in a draw): '_v###' stands for the next free version and
+    '####' for the frame number of an image sequence.
+    """
+    stem = os.path.basename(resolve_render_filepath(settings, scene))
+    if settings.autoVersion:
+        stem = "%s_v%s" % (base_stem_of(stem.rstrip('_')),
+                           "#" * int(settings.versionPadding))
+    if output_is_video(settings):
+        return stem + CONTAINER_EXTENSIONS.get(settings.outputEncoding, '.mp4')
+    return stem.rstrip('_') + "_####" + IMAGE_FORMAT_EXTENSIONS.get(
+        settings.imageEncoding, '.png')
 
 
 # =========================================================================
@@ -651,53 +680,6 @@ def set_shading_on_space(space, color_mode, solid_mode):
     return True
 
 
-def apply_shading_mode(color_mode, solid_mode, context=None):
-    """Safely applies shading to all 3D viewports without disrupting dialogs."""
-    if color_mode == 'CURRENT':
-        return
-    if context is None:
-        context = bpy.context
-    try:
-        windows = list(context.window_manager.windows)
-    except Exception:
-        return
-    for win in windows:
-        try:
-            areas = list(win.screen.areas)
-        except Exception:
-            continue
-        for area in areas:
-            if area.type != 'VIEW_3D':
-                continue
-            try:
-                spaces = list(area.spaces)
-            except Exception:
-                continue
-            for space in spaces:
-                if space.type != 'VIEW_3D':
-                    continue
-                try:
-                    set_shading_on_space(space, color_mode, solid_mode)
-                except Exception:
-                    pass
-            try:
-                area.tag_redraw()
-            except Exception:
-                pass
-
-
-def on_shading_update(self, context):
-    """
-    Fired when ColorMode / SolidMode change (on the scene group OR on the
-    settings operator - the property definitions are shared).  Applying
-    immediately is safe: both owners are non-modal UI.
-    """
-    try:
-        apply_shading_mode(self.ColorMode, self.SolidMode, context)
-    except Exception:
-        pass
-
-
 # =========================================================================
 #  Viewport display control (overlays, gizmos, annotations)
 # =========================================================================
@@ -869,20 +851,14 @@ def apply_ffmpeg_settings_safe(render, settings):
 
     audio_codec = get_safe_audio_codec(ffmpeg, container, settings.audioCodec)
     if audio_codec and audio_codec != 'NONE':
-        try:
-            ffmpeg.audio_bitrate = int(max(32, min(2048, settings.audioBitrate)))
-        except Exception:
-            pass
-        try:
-            ffmpeg.audio_volume = float(settings.audioVolume)
-        except Exception:
-            pass
+        set_attr_safe(ffmpeg, "audio_bitrate",
+                      int(max(32, min(2048, settings.audioBitrate))))
+        set_attr_safe(ffmpeg, "audio_volume", float(settings.audioVolume))
         if settings.useAudioAdvanced:
-            assign_enum(ffmpeg, "audio_channels", [settings.audioChannels, 'STEREO'])
-            try:
-                ffmpeg.audio_mixrate = int(max(8000, min(192000, settings.audioMixrate)))
-            except Exception:
-                pass
+            assign_enum(ffmpeg, "audio_channels",
+                        [settings.audioChannels, 'STEREO'])
+            set_attr_safe(ffmpeg, "audio_mixrate",
+                          int(max(8000, min(192000, settings.audioMixrate))))
     return codec
 
 
@@ -916,19 +892,24 @@ def get_safe_stamp_settings(render):
     return snapshot
 
 
-def build_stamp_note(settings, width, height, percentage):
+def build_stamp_note(settings, width, height):
     """Assembles the multi-line stamp note burned into the render."""
     lines = ["Playblast | Blender {}".format(bpy.app.version_string)]
     if settings.metadata_resolution:
-        lines.append("Resolution: {} x {} px ({}%)".format(width, height, percentage))
+        lines.append("Resolution: {} x {} px".format(width, height))
     note = (settings.extraInfo or "").strip()
     if note:
         lines.append(note)
     return "\n".join(lines)
 
 
-def apply_stamp_settings(render, settings, note_text):
-    """Configures the burn-in stamps for the playblast."""
+def apply_stamp_settings(render, settings, note_text, final_height):
+    """
+    Configures the burn-in stamps for the playblast.
+
+    `final_height` is the output height in pixels the pipeline computed
+    (PlayblastJob.note_size); the auto font size scales with it.
+    """
     for attr in ('use_stamp', 'use_stamp_date', 'use_stamp_time',
                  'use_stamp_frame', 'use_stamp_note'):
         if hasattr(render, attr):
@@ -953,11 +934,8 @@ def apply_stamp_settings(render, settings, note_text):
     # Font size always applies; Blender's default (12 px) is unreadable at HD+.
     if hasattr(render, 'stamp_font_size'):
         try:
-            if settings.stampAutoSize:
-                height = render.resolution_y * render.resolution_percentage / 100.0
-                size = height / 45.0          # ~24 px at 1080p
-            else:
-                size = settings.stampFontSize
+            size = (final_height / 45.0 if settings.stampAutoSize
+                    else settings.stampFontSize)   # ~24 px at 1080p
             render.stamp_font_size = int(max(8, min(200, size)))
         except Exception:
             pass
@@ -982,9 +960,15 @@ def get_media_type(image_settings):
     return get_attr_safe(image_settings, "media_type")
 
 
-def apply_output_format(render, settings, want_video):
+def apply_output_format(render, settings, want_video,
+                        container=None, image_format=None):
     """
     Configures `render.image_settings` for a movie or an image sequence.
+
+    `container` / `image_format` override the values read from `settings`;
+    playback passes the format RECORDED for an existing playblast, and with a
+    container override only the container is touched (the codec settings of
+    an existing movie are irrelevant to playback).
 
     ORDER MATTERS on 5.0+: the `file_format` enum is filtered by `media_type`,
     so 'FFMPEG' is only assignable while media_type is 'VIDEO'.  On 4.x
@@ -997,12 +981,19 @@ def apply_output_format(render, settings, want_video):
         if assign_enum(image_settings, "file_format", ['FFMPEG']) is None:
             return False, ("FFmpeg video output is not available in this Blender "
                            "build. Choose 'Image Sequence' instead.")
-        apply_ffmpeg_settings_safe(render, settings)
+        if container is not None:
+            ffmpeg = getattr(render, "ffmpeg", None)
+            if ffmpeg is not None:
+                assign_enum(ffmpeg, "format", [container, 'MPEG4'])
+        else:
+            apply_ffmpeg_settings_safe(render, settings)
         return True, ""
 
     assign_enum(image_settings, "media_type", ['IMAGE'])
-    if assign_enum(image_settings, "file_format", [settings.imageEncoding, 'PNG']) is None:
-        return False, "The selected image format is not available in this Blender build."
+    requested = image_format or settings.imageEncoding or 'PNG'
+    if assign_enum(image_settings, "file_format", [requested, 'PNG']) is None:
+        return False, ("The selected image format is not available in this "
+                       "Blender build.")
     return True, ""
 
 
@@ -1079,7 +1070,7 @@ class StateSnapshot:
             'display': snapshot_display(space),
             'shading_type': get_attr_safe(shading, "type"),
             'shading_color': get_attr_safe(shading, "color_type"),
-            'rv3d_persp': get_attr_safe(rv3d, "persp"),
+            'rv3d_persp': get_attr_safe(rv3d, "view_perspective"),
         }
 
     def restore(self, context, settings):
@@ -1139,7 +1130,7 @@ class StateSnapshot:
                     assign_enum(shading, "color_type", [data['shading_color']])
 
         if self.rv3d is not None and data.get('rv3d_persp'):
-            assign_enum(self.rv3d, "persp", [data['rv3d_persp']])
+            assign_enum(self.rv3d, "view_perspective", [data['rv3d_persp']])
 
         try:
             for win in context.window_manager.windows:
@@ -1156,6 +1147,29 @@ class StateSnapshot:
 
 MAX_HISTORY = 12
 
+# One-click starting points shown above the preset menu.  Applied through
+# dict_to_settings, so every value is validated like a user preset.
+BUILTIN_PRESETS = {
+    "Draft": {
+        'saveOutputToFile': True, 'resolutionMode': 'LIST',
+        'resolutionTemplate': 'x1280y720', 'resolution_percentage': 100,
+        'useFrameStep': True, 'frameStep': 2, 'keyframesOnly': False,
+        'outputEncoding': 'MPEG4', 'outputQuality': 'LOW', 'audioCodec': 'NONE',
+    },
+    "Review": {
+        'saveOutputToFile': True, 'resolutionMode': 'LIST',
+        'resolutionTemplate': 'x1920y1080', 'resolution_percentage': 100,
+        'useFrameStep': False, 'keyframesOnly': False,
+        'outputEncoding': 'MPEG4', 'outputQuality': 'MEDIUM', 'audioCodec': 'AAC',
+    },
+    "Final": {
+        'saveOutputToFile': True, 'resolutionMode': 'LIST',
+        'resolutionTemplate': 'x1920y1080', 'resolution_percentage': 100,
+        'useFrameStep': False, 'keyframesOnly': False,
+        'outputEncoding': 'MPEG4', 'outputQuality': 'HIGH', 'audioCodec': 'AAC',
+    },
+}
+
 # Runtime state: never written into a preset, never mirrored to the settings
 # operator.
 BOOKKEEPING_PROPS = frozenset((
@@ -1165,11 +1179,17 @@ BOOKKEEPING_PROPS = frozenset((
     'last_playblast_file', 'last_render_seconds', 'last_render_frames',
 ))
 
+# Machine-specific values: still mirrored to the settings operator (the panel
+# edits them) but never written into a preset, so presets transfer between
+# machines and projects.  NOTE: do not put these in BOOKKEEPING_PROPS - that
+# would also drop them from MIRRORED_NAMES and break the settings panel.
+NON_PRESET_PROPS = frozenset(('outputFilePath',))
+
 
 def is_preset_prop(name):
-    """True for user-facing settings (not runtime or accordion state)."""
+    """True for user-facing settings (not runtime bookkeeping)."""
     return (name != 'rna_type' and name not in BOOKKEEPING_PROPS
-            and not name.startswith('ui_sec_'))
+            and name not in NON_PRESET_PROPS)
 
 
 def preset_directory(create=False):
@@ -1286,6 +1306,8 @@ def dict_to_settings(settings, data):
 def save_preset(name, settings):
     """Writes a preset file. Returns (ok, message)."""
     name = sanitize_filename(name) or "preset"
+    if name in BUILTIN_PRESETS:
+        name += "_custom"      # built-ins always win on load: never shadow one
     directory = preset_directory(create=True)
     try:
         if not os.path.isdir(directory):
@@ -1305,7 +1327,10 @@ def save_preset(name, settings):
 
 
 def load_preset(name, settings):
-    """Reads a preset file. Returns (ok, message)."""
+    """Applies a built-in or saved preset. Returns (ok, message)."""
+    if name in BUILTIN_PRESETS:
+        count = dict_to_settings(settings, BUILTIN_PRESETS[name])
+        return True, "Applied the '%s' preset (%d settings)." % (name, count)
     directory = preset_directory(create=False)
     path = os.path.join(directory, sanitize_filename(name) + ".json")
     try:
@@ -1344,7 +1369,8 @@ def set_active_preset(settings, name):
     is what Blender itself uses for presets (see RENDER_MT_presets).
     """
     try:
-        settings.preset_active = name if name in list_presets() else ""
+        known = name in BUILTIN_PRESETS or name in list_presets()
+        settings.preset_active = name if known else ""
     except Exception:
         pass
     return settings.preset_active
@@ -1419,7 +1445,7 @@ def estimate_output(settings, scene):
 
     return {
         'start': start, 'end': end, 'step': step, 'frames': frames,
-        'width': width, 'height': height, 'percentage': pct,
+        'width': width, 'height': height,
         'fps': fps, 'duration': duration, 'eta': eta,
         'video': output_is_video(settings),
         'container': settings.outputEncoding,
@@ -1624,8 +1650,8 @@ class PlayblastSettingsGroup(PropertyGroup):
         ('RANDOM',   "Random", ""),
         ('TEXTURE',  "Texture", ""),
     )
-    SolidMode: EnumProperty(name="Color", items=SolidmodeContainer, default='MATERIAL',
-                            update=on_shading_update)
+    SolidMode: EnumProperty(name="Color", items=SolidmodeContainer,
+                            default='MATERIAL')
 
     ColorContainer = (
         ('CURRENT',   "Keep Current", "Use current viewport shading as-is"),
@@ -1635,18 +1661,21 @@ class PlayblastSettingsGroup(PropertyGroup):
         ('RENDERED',  "Rendered", "Switch to Rendered shading - can be very slow"),
     )
     ColorMode: EnumProperty(name="Viewport Shading", items=ColorContainer,
-                            default='CURRENT', update=on_shading_update)
+                            default='CURRENT')
 
     restore_shading: BoolProperty(
         name="Revert Shading After Playblast",
-        description="Revert viewport shading to its pre-render state when done",
-        default=False)
+        description="Revert viewport shading to its pre-render state when done "
+                    "(shading is only changed for the playblast itself)",
+        default=True)
 
     useCameraView: BoolProperty(
-        name="Force Camera View",
-        description="Temporarily switch the viewport to camera perspective for the "
-                    "playblast, then restore the previous view",
-        default=False)
+        name="Playblast From Camera",
+        description="Render the playblast through the scene camera (on by default). "
+                    "Temporarily switches the viewport to camera perspective for the "
+                    "playblast, then restores the previous view. If the scene has no "
+                    "camera, falls back to the current viewport view",
+        default=True)
 
     # ---- Display / overlays ----
     autoDisableOverlays: BoolProperty(
@@ -1695,17 +1724,6 @@ class PlayblastSettingsGroup(PropertyGroup):
         name="Play After Render",
         description="Open the result in the animation player as soon as it finishes",
         default=True)
-
-    # Settings-panel accordion state (never stored in presets).
-    ui_sec_resolution: BoolProperty(name="Resolution", default=False)
-    ui_sec_range: BoolProperty(name="Frame Range", default=False)
-    ui_sec_output: BoolProperty(name="Output", default=True)
-    ui_sec_format: BoolProperty(name="Format", default=False)
-    ui_sec_audio: BoolProperty(name="Audio", default=False)
-    ui_sec_stamps: BoolProperty(name="Metadata Stamps", default=False)
-    ui_sec_viewport: BoolProperty(name="Viewport", default=False)
-    ui_sec_playback: BoolProperty(name="Playback", default=False)
-    ui_sec_history: BoolProperty(name="History", default=False)
 
     # ---- Presets ----
     preset_active: StringProperty(
@@ -1774,8 +1792,7 @@ def sync_operator_to_pg(op, settings):
 def reopen_settings():
     """
     Re-runs the settings operator so the Adjust Last Operation panel survives
-    operations launched from inside it (preset load/save/delete, clear
-    history) - those operators would otherwise become the redo target.
+    operations launched from inside it (preset load/save/delete) - those operators would otherwise become the redo target.
     """
     try:
         bpy.ops.my.playblast_settings('INVOKE_DEFAULT')
@@ -1846,6 +1863,10 @@ def draw_summary(layout, settings, scene, icon='INFO'):
               icon=icon)
     col.label(text="%d x %d px   %s"
               % (info['width'], info['height'], format_duration(info['duration'])))
+    if getattr(settings, 'useCameraView', False) and getattr(scene, 'camera', None):
+        col.label(text="View: camera '%s'" % scene.camera.name, icon='CAMERA_DATA')
+    else:
+        col.label(text="View: current viewport", icon='VIEW3D')
     kind = info['container'] if info['video'] else ("%s sequence" % settings.imageEncoding)
     col.label(text="Output: %s" % kind)
     if info['eta'] is not None:
@@ -1874,27 +1895,43 @@ def draw_warning_blocks(layout, settings, scene, render):
     if settings.keyframesOnly:
         _notice(layout, "Uses the SELECTED objects' keys")
     if settings.useCameraView and scene.camera is None:
-        _notice(layout, "No scene camera set", 'ERROR', alert=True)
+        _notice(layout, "No scene camera set", 'ERROR', alert=True,
+                detail="'Playblast From Camera' falls back to the current "
+                       "viewport view.")
 
 
 def draw_preset_row(layout, settings):
-    """Preset menu (the pattern Blender uses for its own presets) + save."""
+    """Preset menu + save, with the one-click built-in presets underneath."""
     row = layout.row(align=True)
     row.menu(PLAYBLAST_MT_presets.bl_idname,
              text=(settings.preset_active or "Presets"), icon='PRESET')
     row.operator(PlayblastPresetSave.bl_idname, text="", icon='ADD')
 
-
-def _accordion(layout, owner, attr, label):
-    """
-    Flat accordion header row: triangle icon + label, left aligned, no emboss.
-    Returns True when the section is expanded.
-    """
-    expanded = bool(getattr(owner, attr))
     row = layout.row(align=True)
-    row.prop(owner, attr, text=label, emboss=False,
-             icon=('TRIA_DOWN' if expanded else 'TRIA_RIGHT'))
-    return expanded
+    for name in BUILTIN_PRESETS:
+        op = row.operator(PlayblastPresetLoad.bl_idname, text=name,
+                          depress=(settings.preset_active == name))
+        op.preset_name = name
+
+
+def _section_box(layout, label, icon='NONE'):
+    """
+    One titled box per section, the same look as the summary box at the top
+    of the panel.  Returns the box: draw the section's controls into it.
+    Boxes bring their own padding, so no manual separators are needed.
+    """
+    box = layout.box()
+    box.label(text=label, icon=icon)
+    return box
+
+
+def _toggle_with_field(layout, owner, toggle, field, field_text):
+    """A checkbox and its value field on one row; the field greys out when off."""
+    row = layout.row(align=True)
+    row.prop(owner, toggle)
+    sub = row.row(align=True)
+    sub.active = bool(getattr(owner, toggle))
+    sub.prop(owner, field, text=field_text)
 
 
 def _section_resolution(layout, owner):
@@ -1923,10 +1960,7 @@ def _section_range(layout, owner):
             row.label(text="End must be >= Start", icon='ERROR')
     elif owner.frameRangeMode == 'PREVIEW':
         layout.label(text="Preview range enabled temporarily", icon='INFO')
-    layout.prop(owner, "useFrameStep")
-    row = layout.row()
-    row.active = owner.useFrameStep
-    row.prop(owner, "frameStep", text="Step Size")
+    _toggle_with_field(layout, owner, "useFrameStep", "frameStep", "Step")
     layout.prop(owner, "keyframesOnly")
 
 
@@ -1934,37 +1968,37 @@ def _section_output(layout, owner):
     layout.prop(owner, "saveOutputToFile")
     if not owner.saveOutputToFile:
         layout.label(text="Renders a temporary PNG sequence", icon='INFO')
+        layout.prop(owner, "autoPlay")
         return
-    layout.prop(owner, "outputFilePath")
-    layout.prop(owner, "outputFileName")
+
+    scene = bpy.context.scene
+    layout.prop(owner, "outputFilePath", text="Folder")
+    layout.prop(owner, "outputFileName", text="Name")
+    # Live result of folder + name + tokens + version + format.
+    layout.label(text=preview_filename(owner, scene), icon='FILE_TICK')
     layout.prop(owner, "useNameTokens")
     if owner.useNameTokens:
+        hint = layout.column(align=True)
+        hint.active = False          # greyed: reference text, not a control
         for line in TOKEN_HELP_LINES:
-            layout.label(text=line, icon='INFO')
-    layout.prop(owner, "autoVersion")
-    row = layout.row()
-    row.active = owner.autoVersion
-    row.prop(owner, "versionPadding", text="Version Digits")
+            hint.label(text=line)
+    _toggle_with_field(layout, owner, "autoVersion", "versionPadding", "Digits")
 
-    target_dir = os.path.dirname(resolve_render_filepath(owner))
+    layout.prop(owner, "outputEncoding", text="Format")
+    if owner.outputEncoding != 'IMAGE':
+        layout.prop(owner, "outputQuality")
+    else:
+        layout.prop(owner, "imageEncoding")
+    layout.prop(owner, "autoPlay")
+
+    target_dir = os.path.dirname(resolve_render_filepath(owner, scene))
     if target_dir and not directory_is_writable(target_dir):
         row = layout.row()
         row.alert = True
         row.label(text="Folder is not writable!", icon='ERROR')
 
 
-def _section_format(layout, owner):
-    layout.prop(owner, "outputEncoding")
-    if owner.outputEncoding != 'IMAGE':
-        layout.prop(owner, "outputQuality")
-    else:
-        layout.prop(owner, "imageEncoding")
-
-
 def _section_audio(layout, owner):
-    if owner.outputEncoding == 'IMAGE':
-        layout.label(text="Image sequences have no audio", icon='INFO')
-        return
     layout.prop(owner, "audioCodec")
     if owner.audioCodec != 'NONE':
         layout.prop(owner, "audioBitrate")
@@ -1975,12 +2009,16 @@ def _section_audio(layout, owner):
             layout.prop(owner, "audioMixrate")
 
 
+def _audio_applies(owner):
+    """Audio only exists in a saved movie, never in sequences or temp output."""
+    return owner.saveOutputToFile and owner.outputEncoding != 'IMAGE'
+
+
 def _section_stamps(layout, owner):
-    col = layout.column(align=True)
-    col.prop(owner, "metadata_resolution")
-    col.prop(owner, "metadata_scene_name")
-    col.prop(owner, "metadata_camera_name")
-    col.prop(owner, "metadata_camera_lens")
+    layout.prop(owner, "metadata_resolution")
+    layout.prop(owner, "metadata_scene_name")
+    layout.prop(owner, "metadata_camera_name")
+    layout.prop(owner, "metadata_camera_lens")
     layout.prop(owner, "extraInfo", text="Note")
     layout.prop(owner, "stampAutoSize")
     if not owner.stampAutoSize:
@@ -1993,42 +2031,59 @@ def _section_stamps(layout, owner):
 
 
 def _section_viewport(layout, owner):
+    layout.prop(owner, "useCameraView")
     layout.prop(owner, "ColorMode", text="Shading")
     if owner.ColorMode == 'SOLID':
         layout.prop(owner, "SolidMode", text="Color")
     if owner.ColorMode != 'CURRENT':
         layout.prop(owner, "restore_shading")
-    layout.prop(owner, "useCameraView")
     layout.prop(owner, "autoDisableOverlays")
     if owner.autoDisableOverlays:
         layout.prop(owner, "overlayMode", text="Mode")
         if owner.overlayMode == 'CUSTOM':
-            grid = layout.column(align=True)
             for attr, _target, _props, label, _default in DISPLAY_TOGGLES:
                 if not hasattr(owner, attr):
                     continue
-                grid.prop(owner, attr, text=label)
+                layout.prop(owner, attr, text=label)
 
 
-def _section_playback(layout, owner):
-    layout.prop(owner, "autoPlay")
-
-
-# (ui state attr, label, draw function) - single source of truth for the
-# accordion sections shown in the Adjust Last Operation panel.
+# (label, icon, draw function, visible predicate or None) - single source of
+# truth for the boxes of the settings panel, ordered what -> where -> look.
 SETTINGS_SECTIONS = (
-    ('ui_sec_resolution', "Resolution",      _section_resolution),
-    ('ui_sec_range',      "Frame Range",     _section_range),
-    ('ui_sec_output',     "Output",          _section_output),
-    ('ui_sec_format',     "Format",          _section_format),
-    ('ui_sec_audio',      "Audio",           _section_audio),
-    ('ui_sec_stamps',     "Metadata Stamps", _section_stamps),
-    ('ui_sec_viewport',   "Viewport",        _section_viewport),
-    ('ui_sec_playback',   "Playback",        _section_playback),
+    ("Resolution",      'FULLSCREEN_ENTER', _section_resolution, None),
+    ("Frame Range",     'TIME',             _section_range,      None),
+    ("Output",          'FILE_FOLDER',      _section_output,     None),
+    ("Viewport",        'VIEW3D',           _section_viewport,   None),
+    ("Audio",           'SOUND',            _section_audio,      _audio_applies),
+    ("Metadata Stamps", 'FONT_DATA',        _section_stamps,     None),
 )
 
 
-def draw_history(layout, settings):
+# History rows stat their file on EVERY panel redraw - invisible locally,
+# laggy on network drives.  Results are cached briefly: the panel redraws on
+# every mouse move, and a file appearing/vanishing mid-hover does not need
+# to show up instantly.
+_FILE_EXISTS_TTL = 2.0
+_file_exists_cache = {}
+
+
+def file_exists_cached(path, ttl=_FILE_EXISTS_TTL):
+    """os.path.isfile with a short-lived cache, for constantly-redrawn UI."""
+    if not path:
+        return False
+    now = time.time()
+    hit = _file_exists_cache.get(path)
+    if hit is not None and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        exists = os.path.isfile(path)
+    except OSError:
+        exists = False
+    _file_exists_cache[path] = (now, exists)
+    return exists
+
+
+def draw_history(layout, owner, settings):
     """Recent playblasts, newest first (two rows per entry: actions + time)."""
     try:
         count = len(settings.history)
@@ -2039,12 +2094,18 @@ def draw_history(layout, settings):
         layout.label(text="No playblasts yet", icon='INFO')
         return
 
+    drawn = False
     for index in range(count):
         item = history_entry(settings, index)
         if item is None:
             continue
-        exists = bool(item.file and os.path.isfile(item.file))
-        row = layout.row(align=True)
+        if drawn:
+            layout.separator()          # small gap BETWEEN entries only
+        drawn = True
+        # One aligned block per entry: its rows sit flush together.
+        col = layout.column(align=True)
+        exists = file_exists_cached(item.file)
+        row = col.row(align=True)
         op = row.operator("my.playblast_play_history", text="",
                           icon='PLAY' if exists else 'ERROR')
         op.index = index
@@ -2055,19 +2116,25 @@ def draw_history(layout, settings):
         if exists:
             op2 = row.operator("my.playblast_open_folder", text="", icon='FILE_FOLDER')
             op2.filepath = os.path.dirname(item.file)
-        layout.label(text=item.stamp, icon='TIME')
+        col.label(text=item.stamp, icon='TIME')
 
-    row = layout.row()
-    row.operator("my.playblast_history_clear", text="Clear History", icon='TRASH')
+    # A toggle on the settings operator itself (see PlayblastSettings): a
+    # separate operator would fight the redo panel's undo/re-execute cycle.
+    layout.prop(owner, "clear_history", toggle=True, icon='TRASH')
 
 
 def draw_settings_ui(layout, owner, settings, context):
     """
-    The complete settings UI as collapsed accordion sections, drawn inside the
-    Adjust Last Operation panel (viewport bottom-left).  Interactive controls
-    come from `owner` (the settings operator) because the redo panel reverts
-    scene-property edits; read-only read-outs come from the scene group.
-    Layout is split-free and single-column: the panel is narrow.
+    The complete settings UI as ONE panel - nothing is collapsed; sections that cannot apply (e.g. audio for image sequences) are hidden,
+    each in its own titled box (matching the summary box) instead of
+    collapsible dropdowns.
+    Drawn inside the Adjust Last Operation panel (viewport bottom-left).
+    Rows use normal, non-aligned spacing so unrelated controls never fuse
+    into one block; align=True is reserved for genuinely paired fields.
+    Interactive controls come from `owner` (the settings operator) because
+    the redo panel reverts scene-property edits; read-only read-outs come
+    from the scene group.  Layout is split-free and single-column: the
+    panel is narrow.
     """
     scene = getattr(context, "scene", None) or bpy.context.scene
     render = scene.render
@@ -2079,16 +2146,11 @@ def draw_settings_ui(layout, owner, settings, context):
     draw_summary(layout, settings, scene, icon='INFO')
     draw_warning_blocks(layout, settings, scene, render)
 
-    for attr, label, draw_func in SETTINGS_SECTIONS:
-        if _accordion(layout, owner, attr, label):
-            box = layout.box()
-            box.use_property_split = False
-            draw_func(box, owner)
+    for label, icon, draw_func, visible in SETTINGS_SECTIONS:
+        if visible is None or visible(owner):
+            draw_func(_section_box(layout, label, icon), owner)
 
-    if _accordion(layout, owner, 'ui_sec_history', "History"):
-        box = layout.box()
-        box.use_property_split = False
-        draw_history(box, settings)
+    draw_history(_section_box(layout, "History", 'RECOVER_LAST'), owner, settings)
 
     layout.use_property_split = False
 
@@ -2121,17 +2183,18 @@ class PlayblastJob:
                                                              scene=self.scene)
         self.area = None
         self.space = None
-        # (width, height, percentage) burned into the stamp note: the final
-        # output size, matching what the encoder actually writes.
-        self.note_size = (self.info['width'], self.info['height'],
-                          self.info['percentage'])
+        # (width, height) burned into the stamp note: the final output size,
+        # matching what the encoder actually writes.
+        self.note_size = (self.info['width'], self.info['height'])
 
     # ------------------------------------------------------------ preflight
     @staticmethod
     def preflight(context):
         """
-        Validation shared by invoke() (dialog) and execute() (EXEC_DEFAULT from
-        Python).  Returns (ok, message).  Has no side effects.
+        Validation shared by invoke() (dialog) and execute() (EXEC_DEFAULT
+        from Python).  Returns (ok, message).  Side effects are limited to
+        creating the output folder and writing a probe file, and only when
+        'Save to File' is enabled.
         """
         if bpy.app.background:
             return False, ("Playblast needs a window with a 3D Viewport "
@@ -2144,8 +2207,9 @@ class PlayblastJob:
         if area is None or space is None or region is None:
             return False, NO_VIEWPORT_MESSAGE
 
-        if settings.useCameraView and scene.camera is None:
-            return False, "'Force Camera View' is on but the scene has no camera."
+        # NOTE: no hard error for useCameraView without a scene camera - the
+        # option is on by default, so camera-less scenes fall back to the
+        # current viewport view with a warning (see _prepare_viewport).
 
         if settings.frameRangeMode == 'CUSTOM' and \
                 settings.frameRangeStart == settings.frameRangeEnd:
@@ -2198,30 +2262,20 @@ class PlayblastJob:
         return True
 
     def _prepare_resolution(self):
-        render = self.render
-        settings = self.settings
-        res_x, res_y = self.info['width'], self.info['height']
+        # estimate_output() already resolved mode/template/percentage into the
+        # final size (self.note_size), so write that directly for videos and
+        # images alike: the encoder gets baked pixels at 100% and the stamp
+        # note matches what is actually written.
+        w, h = self.note_size
         if self.want_video:
             # Movie encoders need even dimensions, otherwise FFmpeg fails.
-            if res_x % 2:
-                res_x += 1
-            if res_y % 2:
-                res_y += 1
-            render.resolution_x = res_x
-            render.resolution_y = res_y
-            render.resolution_percentage = 100
-            self.note_size = (res_x, res_y, 100)
-        else:
-            if settings.resolutionMode != 'SYNC':
-                base_x, base_y = ((parse_resolution(settings.resolutionTemplate)
-                                   if settings.resolutionMode == 'LIST'
-                                   else (int(settings.resolutionX),
-                                         int(settings.resolutionY))))
-                render.resolution_x = base_x
-                render.resolution_y = base_y
-                render.resolution_percentage = int(settings.resolution_percentage)
-            self.note_size = (self.info['width'], self.info['height'],
-                              int(render.resolution_percentage))
+            w += w % 2
+            h += h % 2
+        render = self.render
+        render.resolution_x = w
+        render.resolution_y = h
+        render.resolution_percentage = 100
+        self.note_size = (w, h)
         return True
 
     def _prepare_output(self):
@@ -2237,9 +2291,9 @@ class PlayblastJob:
         return True
 
     def _prepare_stamps(self):
-        width, height, percentage = self.note_size
-        note_text = build_stamp_note(self.settings, width, height, percentage)
-        apply_stamp_settings(self.render, self.settings, note_text)
+        width, height = self.note_size
+        note_text = build_stamp_note(self.settings, width, height)
+        apply_stamp_settings(self.render, self.settings, note_text, height)
         return True
 
     def _prepare_viewport(self):
@@ -2249,8 +2303,15 @@ class PlayblastJob:
         if settings.ColorMode != 'CURRENT':
             set_shading_on_space(space, settings.ColorMode, settings.SolidMode)
         rv3d = get_attr_safe(space, "region_3d", None)
-        if settings.useCameraView and rv3d is not None:
-            assign_enum(rv3d, "persp", ['CAMERA', 'ORTHO'])
+        if settings.useCameraView:
+            if self.scene.camera is None:
+                report(self.op, 'WARNING',
+                       "'Playblast From Camera' is on but the scene has no "
+                       "camera - playblasting from the current viewport view.")
+            elif rv3d is None or \
+                    assign_enum(rv3d, "view_perspective", ['CAMERA']) is None:
+                report(self.op, 'WARNING',
+                       "Could not switch the viewport to camera view.")
         try:
             self.area.tag_redraw()
         except Exception:
@@ -2275,11 +2336,21 @@ class PlayblastJob:
         return True
 
     # -------------------------------------------------- verify and record
-    def _verify_and_record(self, elapsed):
+    def _verify_and_record(self, started):
         settings = self.settings
         info = self.info
+        elapsed = time.time() - started
 
-        written = find_output_files(self.target_path, self.want_video)
+        # Only files from THIS run count: stale output from an earlier run
+        # would otherwise make verification pass even when this render wrote
+        # nothing ('playblast_temp_' especially collides with old runs).
+        # The cutoff is anchored to `started` (not now - elapsed) with 2 s
+        # slack: file timestamps on network volumes can drift seconds from
+        # the system clock, and rejecting a valid file is worse than the
+        # tiny chance of letting a seconds-old stale one through.
+        cutoff = started - 2.0
+        written = [p for p in find_output_files(self.target_path, self.want_video)
+                   if os.path.getmtime(p) >= cutoff]
         if not written:
             report(self.op, 'ERROR',
                    "The render finished but no output file was found at "
@@ -2341,7 +2412,7 @@ class PlayblastJob:
                  self._prepare_stamps, self._prepare_viewport, self._render)
         try:
             if all(step() for step in steps):
-                if self._verify_and_record(time.time() - started):
+                if self._verify_and_record(started):
                     status = {'FINISHED'}
                     if settings.autoPlay:
                         self._playback()
@@ -2387,15 +2458,19 @@ def play_output(context, operator, base_path, is_video, container, image_encodin
         # play_rendered_anim reads render.filepath and the format at call time.
         render.use_file_extension = True
 
+        # Use the format the playblast was RENDERED with (passed in from the
+        # history/last-run bookkeeping), not what the UI would render next.
+        chosen_container = None
         if is_video:
-            assign_enum(image_settings, "media_type", ['VIDEO'])
-            assign_enum(image_settings, "file_format", ['FFMPEG'])
-            chosen = container if container not in ('', 'IMAGE') else settings.outputEncoding
-            if hasattr(render, "ffmpeg"):
-                assign_enum(render.ffmpeg, "format", [chosen, 'MPEG4'])
-        else:
-            assign_enum(image_settings, "media_type", ['IMAGE'])
-            assign_enum(image_settings, "file_format", [image_encoding or 'PNG', 'PNG'])
+            chosen_container = (container if container not in ('', 'IMAGE')
+                                else settings.outputEncoding)
+        ok, message = apply_output_format(
+            render, settings, is_video,
+            container=chosen_container,
+            image_format=(image_encoding or 'PNG') if not is_video else None)
+        if not ok:
+            report(operator, 'ERROR', message)
+            return False
 
         render.filepath = movie_filepath(render, base_path) if is_video else base_path
         res = normalize_operator_result(bpy.ops.render.play_rendered_anim())
@@ -2442,6 +2517,15 @@ class PlayblastSettings(Operator):
     ui_session: BoolProperty(name="UI Session", default=False,
                              options={'HIDDEN'})
 
+    # One-shot button drawn in the History box.  Every redo-panel edit undoes
+    # to the state before this operator and re-runs it, which would bring a
+    # history cleared by a SEPARATE operator straight back; clearing inside
+    # execute() runs after that undo, so it sticks.  Operator-only: it is not
+    # in the scene group, so it is never mirrored or saved in presets.
+    clear_history: BoolProperty(
+        name="Clear History", default=False, options={'SKIP_SAVE'},
+        description="Remove all entries from the recent playblasts list")
+
     def invoke(self, context, event):
         self.ui_session = True
         sync_pg_to_operator(self, context.scene.playblast_settings)
@@ -2463,7 +2547,15 @@ class PlayblastSettings(Operator):
             return {'FINISHED'}
 
         sync_operator_to_pg(self, settings)
-        apply_shading_mode(self.ColorMode, self.SolidMode, context)
+        if self.clear_history:
+            self.clear_history = False       # one-shot: untick for the redraw
+            try:
+                settings.history.clear()
+            except Exception as exc:
+                report(self, 'ERROR', "Could not clear history: %s" % exc)
+                return {'CANCELLED'}
+            _file_exists_cache.clear()       # its paths belonged to the rows
+            report(self, 'INFO', "History cleared.")
         return {'FINISHED'}
 
 
@@ -2544,7 +2636,8 @@ class ViewPlayblastHistory(Operator):
     bl_idname = "my.playblast_play_history"
     bl_label = "Play History Entry"
     bl_description = "Play this entry in the animation player"
-    bl_options = {'REGISTER'}
+    # No REGISTER: a registered operator becomes the 'last operation' and
+    # would replace the settings panel (this one changes no settings).
 
     index: IntProperty(name="Index", default=0)
 
@@ -2567,7 +2660,8 @@ class PlayblastOpenFolder(Operator):
     bl_idname = "my.playblast_open_folder"
     bl_label = "Open Output Folder"
     bl_description = "Open the output folder in the system file browser"
-    bl_options = {'REGISTER'}
+    # No REGISTER: a registered operator becomes the 'last operation' and
+    # would replace the settings panel (this one changes no settings).
 
     filepath: StringProperty(name="Folder", default="", subtype='DIR_PATH')
 
@@ -2614,7 +2708,7 @@ class PlayblastPresetSave(Operator):
             report(self, 'ERROR', "Could not save preset: %s" % message)
             return {'CANCELLED'}
         set_active_preset(context.scene.playblast_settings,
-                          sanitize_filename(self.preset_name))
+                          os.path.splitext(os.path.basename(message))[0])
         report(self, 'INFO', "Preset saved to %s" % message)
         reopen_settings()
         return {'FINISHED'}
@@ -2672,24 +2766,6 @@ class PlayblastPresetDelete(Operator):
         return {'FINISHED'} if ok else {'CANCELLED'}
 
 
-class PlayblastHistoryClear(Operator):
-    """Clear the recent playblast list"""
-    bl_idname = "my.playblast_history_clear"
-    bl_label = "Clear Playblast History"
-    bl_description = "Remove all entries from the recent playblasts list"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        try:
-            context.scene.playblast_settings.history.clear()
-        except Exception as exc:
-            report(self, 'ERROR', "Could not clear history: %s" % exc)
-            return {'CANCELLED'}
-        report(self, 'INFO', "History cleared.")
-        reopen_settings()
-        return {'FINISHED'}
-
-
 # =========================================================================
 #  Preset menu
 # =========================================================================
@@ -2706,13 +2782,17 @@ class PLAYBLAST_MT_presets(Menu):
         names = list_presets()
         active = settings.preset_active
 
-        if not names:
-            layout.label(text="(no presets saved yet)", icon='INFO')
-        else:
+        def add_entry(name):
+            icon = 'RADIOBUT_ON' if name == active else 'RADIOBUT_OFF'
+            op = layout.operator(PlayblastPresetLoad.bl_idname, text=name, icon=icon)
+            op.preset_name = name
+
+        for name in BUILTIN_PRESETS:
+            add_entry(name)
+        if names:
+            layout.separator()
             for name in names:
-                icon = 'RADIOBUT_ON' if name == active else 'RADIOBUT_OFF'
-                op = layout.operator(PlayblastPresetLoad.bl_idname, text=name, icon=icon)
-                op.preset_name = name
+                add_entry(name)
 
         layout.separator()
         layout.operator(PlayblastPresetSave.bl_idname, text="Save Preset...", icon='ADD')
@@ -2767,7 +2847,6 @@ classes = (
     PlayblastPresetSave,
     PlayblastPresetLoad,
     PlayblastPresetDelete,
-    PlayblastHistoryClear,
     PlayblastSettings,
     PLAYBLAST_MT_presets,
     PlayblastMainPanel,
