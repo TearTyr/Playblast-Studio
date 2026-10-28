@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Playblast Animation Plugin",
     "author": "TearTyr",
-    "version": (4, 4, 0),
+    "version": (4, 5, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Playblast",
     "description": (
@@ -11,7 +11,8 @@ bl_info = {
         "Operation panel (viewport bottom-left). Targets Blender 4.0 and newer."
     ),
     "warning": "",
-    "doc_url": "",
+    "doc_url": "https://github.com/TearTyr/Playblast-Studio",
+    "tracker_url": "https://github.com/TearTyr/Playblast-Studio/issues",
     "category": "Animation",
 }
 
@@ -293,6 +294,26 @@ def get_user_name():
 
 
 _WILD = '\ue000'  # stands for 'any number' when scanning for versions
+_TOKEN_RE = re.compile(r'\{(\w+)\}')
+
+
+def _token_value(value):
+    """
+    A token value is ONE path component.  Without this a camera named 'A/B'
+    would silently create a sub-folder, and a scene named '..' could climb out
+    of the output folder.
+    """
+    return sanitize_filename(str(value)).replace("/", "-").replace("\\", "-")
+
+
+def _clean_name_path(name):
+    """
+    The file-name template may contain sub-folders ('shots/{scene}'), but never
+    empty, '.' or '..' segments, so the result always stays under the folder.
+    """
+    parts = [part for part in re.split(r'[\\/]+', name)
+             if part and part not in ('.', '..')]
+    return "/".join(parts)
 
 
 def expand_name_tokens(template, scene, settings, wild=False):
@@ -312,14 +333,15 @@ def expand_name_tokens(template, scene, settings, wild=False):
     start, end, step = effective_frame_range(settings, scene)
 
     blend_path = getattr(bpy.data, "filepath", "") or ""
+    now = time.localtime()   # one clock read: date/time/datetime always agree
     values = {
         'scene': scene.name or "scene",
         'camera': (camera.name if camera is not None else "nocam"),
         'blend': (os.path.splitext(os.path.basename(blend_path))[0] or "untitled"),
         'user': get_user_name(),
-        'date': time.strftime("%Y-%m-%d"),
-        'time': time.strftime("%H%M%S"),
-        'datetime': time.strftime("%Y%m%d_%H%M%S"),
+        'date': time.strftime("%Y-%m-%d", now),
+        'time': time.strftime("%H%M%S", now),
+        'datetime': time.strftime("%Y%m%d_%H%M%S", now),
         # With wild=True the range tokens match ANY range, so a changed frame
         # range no longer restarts the version count at v001.
         'start': _WILD if wild else str(start),
@@ -329,9 +351,12 @@ def expand_name_tokens(template, scene, settings, wild=False):
         'res': "%dx%d" % (int(render.resolution_x), int(render.resolution_y)),
     }
 
-    out = template
-    for key, value in values.items():
-        out = out.replace("{" + key + "}", value)
+    values = {key: _token_value(value) for key, value in values.items()}
+    # ONE pass: a value that itself contains '{user}' (a scene called
+    # 'shot{user}') must not be expanded a second time.  Unknown tokens stay.
+    out = _TOKEN_RE.sub(
+        lambda m: values[m.group(1)] if m.group(1) in values else m.group(0),
+        template)
     # Collapse the separators a blank token can leave behind.
     out = re.sub(r'_{2,}', '_', out).strip("_ ")
     return out or "playblast"
@@ -396,6 +421,22 @@ def _output_directory(settings):
     return os.path.expanduser(base)
 
 
+def output_directory_notice(settings):
+    """
+    Why the output folder differs from what the user entered ('' when it does
+    not).  I/O-free, so it is safe to call from a draw method.  Blender deletes
+    its session temp folder on exit, so a silent fallback would lose the file.
+    """
+    if not settings.saveOutputToFile:
+        return ""
+    base = (settings.outputFilePath or "").strip()
+    if not base:
+        return "No output folder set: using Blender's temp folder."
+    if base.startswith("//") and not bpy.data.is_saved:
+        return "Unsaved .blend: output goes to Blender's temp folder."
+    return ""
+
+
 def _output_stem(settings, scene, version=0, wild=False):
     """File name without folder or extension, versioned when asked."""
     if not settings.saveOutputToFile:
@@ -404,8 +445,9 @@ def _output_stem(settings, scene, version=0, wild=False):
     name = settings.outputFileName or "playblast"
     if settings.useNameTokens and scene is not None:
         name = expand_name_tokens(name, scene, settings, wild)
-    # A leading separator would make os.path.join discard the output folder.
-    name = sanitize_filename(name).lstrip("/\\")
+    # Keeps sub-folders, drops leading separators ('/x' would make
+    # os.path.join discard the output folder) and '..' segments.
+    name = _clean_name_path(sanitize_filename(name))
     name = strip_redundant_extension(name, is_video) or "playblast"
     if settings.autoVersion and version > 0:
         name = "%s_v%0*d" % (base_stem_of(name),
@@ -892,9 +934,11 @@ def get_safe_stamp_settings(render):
     return snapshot
 
 
-def build_stamp_note(settings, width, height):
+def build_stamp_note(settings, width, height, version=0):
     """Assembles the multi-line stamp note burned into the render."""
     lines = ["Playblast | Blender {}".format(bpy.app.version_string)]
+    if version and getattr(settings, 'metadata_version', True):
+        lines.append("Version: v%0*d" % (int(settings.versionPadding), int(version)))
     if settings.metadata_resolution:
         lines.append("Resolution: {} x {} px".format(width, height))
     note = (settings.extraInfo or "").strip()
@@ -1303,9 +1347,15 @@ def dict_to_settings(settings, data):
     return applied
 
 
+def preset_file_stem(name):
+    """Preset names are file stems: 'a/../b' must never leave the folder."""
+    stem = sanitize_filename(re.sub(r'[\\/]+', "_", str(name or "")))
+    return stem.lstrip(".")
+
+
 def save_preset(name, settings):
     """Writes a preset file. Returns (ok, message)."""
-    name = sanitize_filename(name) or "preset"
+    name = preset_file_stem(name) or "preset"
     if name in BUILTIN_PRESETS:
         name += "_custom"      # built-ins always win on load: never shadow one
     directory = preset_directory(create=True)
@@ -1315,6 +1365,7 @@ def save_preset(name, settings):
         path = os.path.join(directory, name + ".json")
         payload = {
             'addon': 'Playblast Animation Plugin',
+            'schema': 1,
             'blender': list(bpy.app.version),
             'saved': time.strftime("%Y-%m-%d %H:%M:%S"),
             'settings': settings_to_dict(settings),
@@ -1332,7 +1383,7 @@ def load_preset(name, settings):
         count = dict_to_settings(settings, BUILTIN_PRESETS[name])
         return True, "Applied the '%s' preset (%d settings)." % (name, count)
     directory = preset_directory(create=False)
-    path = os.path.join(directory, sanitize_filename(name) + ".json")
+    path = os.path.join(directory, preset_file_stem(name) + ".json")
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -1349,7 +1400,7 @@ def load_preset(name, settings):
 def delete_preset(name):
     """Removes a preset file. Returns (ok, message)."""
     directory = preset_directory(create=False)
-    path = os.path.join(directory, sanitize_filename(name) + ".json")
+    path = os.path.join(directory, preset_file_stem(name) + ".json")
     try:
         os.remove(path)
         return True, "Deleted preset '%s'." % name
@@ -1547,8 +1598,11 @@ class PlayblastSettingsGroup(PropertyGroup):
         default=False)
 
     # ---- Output ----
+    # '//' = next to the .blend.  The old default (Blender's session temp
+    # folder) is deleted when Blender exits.  Unsaved files still fall back to
+    # the temp folder, with a visible warning (see output_directory_notice).
     outputFilePath: StringProperty(name="File Path", subtype="DIR_PATH",
-                                   default=get_default_temp_dir())
+                                   default="//playblasts/")
     outputFileName: StringProperty(
         name="File Name", default="{blend}_{start}-{end}",
         description="Base name without extension. By default the .blend file "
@@ -1696,6 +1750,10 @@ class PlayblastSettingsGroup(PropertyGroup):
 
     # ---- Stamps ----
     metadata_resolution: BoolProperty(name="Resolution", default=True)
+    metadata_version: BoolProperty(
+        name="Version", default=True,
+        description="Burn the auto-version number (v003) into the render, "
+                    "so a reviewer always knows which take they are looking at")
     metadata_camera_name: BoolProperty(name="Camera Name", default=False)
     metadata_camera_lens: BoolProperty(name="Lens", default=False)
     metadata_scene_name: BoolProperty(name="Scene Name", default=True)
@@ -1991,6 +2049,12 @@ def _section_output(layout, owner):
         layout.prop(owner, "imageEncoding")
     layout.prop(owner, "autoPlay")
 
+    notice = output_directory_notice(owner)
+    if notice:
+        row = layout.row()
+        row.alert = True
+        row.label(text=notice, icon='ERROR')
+
     target_dir = os.path.dirname(resolve_render_filepath(owner, scene))
     if target_dir and not directory_is_writable(target_dir):
         row = layout.row()
@@ -2016,6 +2080,8 @@ def _audio_applies(owner):
 
 def _section_stamps(layout, owner):
     layout.prop(owner, "metadata_resolution")
+    if owner.saveOutputToFile and owner.autoVersion:
+        layout.prop(owner, "metadata_version")
     layout.prop(owner, "metadata_scene_name")
     layout.prop(owner, "metadata_camera_name")
     layout.prop(owner, "metadata_camera_lens")
@@ -2292,7 +2358,8 @@ class PlayblastJob:
 
     def _prepare_stamps(self):
         width, height = self.note_size
-        note_text = build_stamp_note(self.settings, width, height)
+        note_text = build_stamp_note(self.settings, width, height,
+                                     self.version if self.settings.autoVersion else 0)
         apply_stamp_settings(self.render, self.settings, note_text, height)
         return True
 
@@ -2349,8 +2416,8 @@ class PlayblastJob:
         # the system clock, and rejecting a valid file is worse than the
         # tiny chance of letting a seconds-old stale one through.
         cutoff = started - 2.0
-        written = [p for p in find_output_files(self.target_path, self.want_video)
-                   if os.path.getmtime(p) >= cutoff]
+        found = find_output_files(self.target_path, self.want_video)
+        written = [p for p in found if os.path.getmtime(p) >= cutoff]
         if not written:
             report(self.op, 'ERROR',
                    "The render finished but no output file was found at "
@@ -2358,6 +2425,16 @@ class PlayblastJob:
                    .format(self.target_path))
             return False
         rendered_file = written[-1]
+
+        if settings.saveOutputToFile and not self.want_video:
+            frame_exts = tuple(IMAGE_FORMAT_EXTENSIONS.values())
+            leftover = [p for p in found if p not in written
+                        and p.lower().endswith(frame_exts)]
+            if leftover:
+                report(self.op, 'WARNING',
+                       "{} older frame(s) from a previous playblast share this "
+                       "name and will play with the new sequence. Enable Auto "
+                       "Version or delete them.".format(len(leftover)))
 
         # Record only now that we know it worked.
         settings.last_playblast_path = self.target_path
@@ -2402,6 +2479,10 @@ class PlayblastJob:
             report(self.op, 'ERROR', NO_VIEWPORT_MESSAGE)
             return {'CANCELLED'}
         self.area, self.space = area, space
+
+        notice = output_directory_notice(settings)
+        if notice:
+            report(self.op, 'WARNING', notice)
 
         snapshot = StateSnapshot(context, self.render, space)
         started = time.time()
@@ -2595,6 +2676,12 @@ class Playblast(Operator):
         col.label(text="Viewport renders called from Python are blocking and")
         col.label(text="cannot be cancelled with Esc - this is Blender's own")
         col.label(text="behaviour, not a limitation of this add-on.")
+
+        notice = output_directory_notice(settings)
+        if notice:
+            row = layout.row()
+            row.alert = True
+            row.label(text=notice, icon='ERROR')
 
         target, _version = resolve_output_path(settings, scene=context.scene,
                                                create_dirs=False)
@@ -2814,11 +2901,7 @@ class PlayblastMainPanel(Panel):
 
     def draw(self, context):
         layout = self.layout
-
-        # Three SEPARATE padded buttons (an unmerged column keeps a visible
-        # gap between them) at a sensible height - "just enough", matching the
-        # reference studio layout.  uiLayout scale is evaluated at DRAW time,
-        # so it is set once here and never reset.
+        
         col = layout.column(align=False)
         col.scale_y = 1.8
         col.operator("my.playblast", text="", icon='RENDER_ANIMATION')
