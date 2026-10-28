@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Playblast Animation Plugin",
     "author": "TearTyr",
-    "version": (4, 5, 0),
+    "version": (4, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Playblast",
     "description": (
@@ -93,6 +93,14 @@ def enum_identifiers(rna_owner, prop_name):
     `rna_owner` must be an RNA instance so that context dependent enums - such
     as `file_format`, filtered by `media_type` in 5.x - resolve correctly.
     Returns an empty set when unknown; callers treat that as "try anyway".
+
+    NOTE: `prop.items` below is bpy_struct.items() (a method), so this always
+    raises and returns set(): assign_enum has effectively been "try anyway"
+    all along, and that is what keeps it working.  Do not "fix" this to
+    `enum_items` without testing on 5.x: for context-dependent enums such as
+    `file_format` the definition-level list is not filtered by media_type and
+    could wrongly reject a valid candidate.  (Presets use the correct
+    `enum_items` - see _enum_ids - because their enums are static.)
     """
     try:
         prop = rna_owner.bl_rna.properties.get(prop_name)
@@ -885,11 +893,24 @@ def apply_ffmpeg_settings_safe(render, settings):
 
     container = settings.outputEncoding
     assign_enum(ffmpeg, "format", [container, 'MPEG4'])
-    codec = get_safe_video_codec(render, container)
-    assign_enum(ffmpeg, "constant_rate_factor", [settings.outputQuality, 'MEDIUM'])
+    codec = None
+    if (container == 'QUICKTIME'
+            and getattr(settings, 'videoCodecPref', 'AUTO') == 'PRORES'):
+        # Only where this build has ProRes; otherwise the normal H.264 path.
+        codec = assign_enum(ffmpeg, "codec", ['PRORES'])
+    if codec is None:
+        codec = get_safe_video_codec(render, container)
+    assign_enum(ffmpeg, "constant_rate_factor",
+                [settings.outputQuality, 'HIGH', 'MEDIUM'])
 
-    if codec in ('H264', 'H265'):
-        assign_enum(ffmpeg, "ffmpeg_preset", ['REALTIME', 'GOOD'])
+    if codec == 'PRORES':
+        assign_enum(ffmpeg, "ffmpeg_prores_profile",
+                    [getattr(settings, 'proresProfile', '422_HQ'),
+                     '422_HQ', '422_STD'])
+    elif codec in ('H264', 'H265'):
+        assign_enum(ffmpeg, "ffmpeg_preset",
+                    [getattr(settings, 'encodingSpeed', 'REALTIME'),
+                     'GOOD', 'REALTIME'])
 
     audio_codec = get_safe_audio_codec(ffmpeg, container, settings.audioCodec)
     if audio_codec and audio_codec != 'NONE':
@@ -1073,6 +1094,7 @@ class StateSnapshot:
     """
 
     FFMPEG_ATTRS = ('format', 'codec', 'constant_rate_factor', 'ffmpeg_preset',
+                    'ffmpeg_prores_profile',
                     'audio_codec', 'audio_bitrate', 'audio_volume',
                     'audio_channels', 'audio_mixrate')
 
@@ -1193,26 +1215,77 @@ MAX_HISTORY = 12
 
 # One-click starting points shown above the preset menu.  Applied through
 # dict_to_settings, so every value is validated like a user preset.
-BUILTIN_PRESETS = {
-    "Draft": {
-        'saveOutputToFile': True, 'resolutionMode': 'LIST',
-        'resolutionTemplate': 'x1280y720', 'resolution_percentage': 100,
-        'useFrameStep': True, 'frameStep': 2, 'keyframesOnly': False,
-        'outputEncoding': 'MPEG4', 'outputQuality': 'LOW', 'audioCodec': 'NONE',
-    },
-    "Review": {
-        'saveOutputToFile': True, 'resolutionMode': 'LIST',
-        'resolutionTemplate': 'x1920y1080', 'resolution_percentage': 100,
-        'useFrameStep': False, 'keyframesOnly': False,
-        'outputEncoding': 'MPEG4', 'outputQuality': 'MEDIUM', 'audioCodec': 'AAC',
-    },
-    "Final": {
-        'saveOutputToFile': True, 'resolutionMode': 'LIST',
-        'resolutionTemplate': 'x1920y1080', 'resolution_percentage': 100,
-        'useFrameStep': False, 'keyframesOnly': False,
-        'outputEncoding': 'MPEG4', 'outputQuality': 'HIGH', 'audioCodec': 'AAC',
-    },
+#
+# Each preset sets the SAME keys (_PRESET_BASE plus its own overrides), so
+# switching from one to another never inherits anything from the previous one.
+# Deliberately not in here: folder, file name, versioning, auto-play, camera
+# view and frame-range mode.  Those are workflow choices, not look/encode ones.
+#
+# Resolution follows the usual studio convention of "from render settings" at
+# scale 1 (or 0.5 for a quick one): the scene decides the size, the preset only
+# scales it.
+_PRESET_BASE = {
+    'saveOutputToFile': True,
+    'useFrameStep': False, 'keyframesOnly': False,
+    'resolutionMode': 'SYNC',
+    'outputEncoding': 'MPEG4', 'videoCodecPref': 'AUTO',
+    'outputQuality': 'HIGH', 'encodingSpeed': 'GOOD',
+    'audioCodec': 'AAC',
+    'ColorMode': 'CURRENT',
+    'autoDisableOverlays': True, 'overlayMode': 'HIDE_OVERLAYS',
+    'useStamps': True,
+    'metadata_resolution': True, 'metadata_version': True,
+    'metadata_scene_name': True, 'metadata_camera_name': True,
+    'metadata_camera_lens': True,
+    'extraInfo': "",
 }
+
+
+def _preset(**overrides):
+    data = dict(_PRESET_BASE)
+    data.update(overrides)
+    return data
+
+
+BUILTIN_PRESETS = {
+    # Blocking pass: as cheap as a playblast gets.  Half the scene resolution,
+    # flat Solid shading, no audio, the fastest encode and a DRAFT stamp so
+    # nobody mistakes it for a real review.  Every frame is rendered: Blender
+    # SKIPS frames for a frame step instead of repeating them, so a stepped
+    # movie would play faster than real time.
+    "Draft": _preset(
+        resolutionMode='SCALE', resolution_percentage=50,
+        outputQuality='LOW', encodingSpeed='REALTIME', audioCodec='NONE',
+        ColorMode='SOLID', SolidMode='MATERIAL',
+        metadata_resolution=False, metadata_scene_name=False,
+        metadata_camera_name=False, metadata_camera_lens=False,
+        extraInfo='DRAFT'),
+    # Dailies: the scene resolution, high-quality H.264 with sound, and every
+    # piece of context burned in (scene, camera, lens, version, resolution)
+    # so feedback can name a frame and a take.  Annotations stay visible.
+    "Review": _preset(),
+    # Master: the scene resolution as ProRes 422 HQ with uncompressed audio
+    # (the editorial standard), a clean plate and NO burn-in.  Where ProRes is
+    # missing it becomes perceptually lossless H.264.
+    "Final": _preset(
+        outputEncoding='QUICKTIME', videoCodecPref='PRORES',
+        proresProfile='422_HQ', outputQuality='PERC_LOSSLESS',
+        encodingSpeed='BEST', audioCodec='PCM',
+        overlayMode='CLEAN', useStamps=False),
+}
+
+PRESET_INFO = {
+    "Draft": ("Scene resolution x 50%, Solid shading",
+              "No audio, fastest encode, DRAFT stamp"),
+    "Review": ("Scene resolution, high-quality H.264 + AAC",
+               "Full burn-in: scene, camera, lens, version"),
+    "Final": ("Scene resolution, ProRes 422 HQ + PCM audio",
+              "Clean plate, no burn-in (H.264 if no ProRes)"),
+}
+
+# Stamp notes a built-in preset may overwrite.  Anything else the user typed
+# into the Note field is theirs and is never touched.
+PRESET_BADGES = frozenset(("DRAFT",))
 
 # Runtime state: never written into a preset, never mirrored to the settings
 # operator.
@@ -1297,6 +1370,21 @@ def settings_to_dict(settings):
     return data
 
 
+def _enum_ids(prop):
+    """
+    Legal identifiers of an enum property definition, or None when unknown.
+
+    The collection is `enum_items`.  `prop.items` is bpy_struct.items() - a
+    METHOD - so iterating it raised, the surrounding `except` swallowed it, and
+    EVERY enum in a preset (resolution mode, format, quality, audio, shading)
+    was silently skipped.  Only booleans and numbers ever applied.
+    """
+    try:
+        return {item.identifier for item in prop.enum_items}
+    except Exception:
+        return None
+
+
 def dict_to_settings(settings, data):
     """
     Restores settings from a preset dict, validating every value against the
@@ -1323,8 +1411,9 @@ def dict_to_settings(settings, data):
         ptype = getattr(prop, 'type', None)
         try:
             if ptype == 'ENUM':
-                identifiers = {i.identifier for i in prop.items}
-                if value in identifiers:
+                identifiers = _enum_ids(prop)
+                # None = could not tell: just try, setattr rejects bad values.
+                if identifiers is None or value in identifiers:
                     setattr(settings, name, value)
                     applied += 1
             elif ptype == 'BOOLEAN':
@@ -1380,8 +1469,17 @@ def save_preset(name, settings):
 def load_preset(name, settings):
     """Applies a built-in or saved preset. Returns (ok, message)."""
     if name in BUILTIN_PRESETS:
-        count = dict_to_settings(settings, BUILTIN_PRESETS[name])
-        return True, "Applied the '%s' preset (%d settings)." % (name, count)
+        data = dict(BUILTIN_PRESETS[name])
+        badge = data.pop('extraInfo', None)
+        count = dict_to_settings(settings, data)
+        if badge is not None:
+            current = (settings.extraInfo or "").strip()
+            if not current or current in PRESET_BADGES:
+                settings.extraInfo = badge
+                count += 1
+        return True, "Applied the '%s' preset: %s." % (
+            name, "; ".join(PRESET_INFO.get(name, ())).lower() or
+            "%d settings" % count)
     directory = preset_directory(create=False)
     path = os.path.join(directory, preset_file_stem(name) + ".json")
     try:
@@ -1480,8 +1578,15 @@ def estimate_output(settings, scene):
     else:
         res_x, res_y = int(scene.render.resolution_x), int(scene.render.resolution_y)
 
-    pct = (int(scene.render.resolution_percentage) if settings.resolutionMode == 'SYNC'
-           else int(settings.resolution_percentage))
+    scene_pct = float(scene.render.resolution_percentage)
+    if settings.resolutionMode == 'SYNC':
+        pct = scene_pct
+    elif settings.resolutionMode == 'SCALE':
+        # What the scene would render, scaled again: 50% of a 1080p scene at
+        # 100% is 960x540; the same scene at 50% gives 480x270.
+        pct = scene_pct * float(settings.resolution_percentage) / 100.0
+    else:
+        pct = float(settings.resolution_percentage)
     width = max(1, int(round(res_x * pct / 100.0)))
     height = max(1, int(round(res_y * pct / 100.0)))
 
@@ -1537,6 +1642,8 @@ class PlayblastSettingsGroup(PropertyGroup):
     # ---- Resolution ----
     resolutionModeContainer = (
         ('SYNC',   "Use Scene Resolution", "Use the current scene render resolution"),
+        ('SCALE',  "Scene Resolution x Scale",
+         "Use the scene resolution scaled by a percentage (50% for fast drafts)"),
         ('LIST',   "Resolution List", "Choose from a preset resolution"),
         ('CUSTOM', "Custom Resolution", "Specify custom pixel dimensions"),
     )
@@ -1658,10 +1765,37 @@ class PlayblastSettingsGroup(PropertyGroup):
         ('LOW',      "Low", ""),
         ('MEDIUM',   "Medium", ""),
         ('HIGH',     "High", ""),
+        ('PERC_LOSSLESS', "Perceptually lossless",
+         "Visually identical to the source, far smaller than Lossless"),
         ('LOSSLESS', "Lossless", ""),
     )
     outputQuality: EnumProperty(name="Quality", items=videoQualityContainer,
                                 default='MEDIUM')
+
+    videoCodecContainer = (
+        ('AUTO',   "Automatic", "The container's usual codec (H.264)"),
+        ('PRORES', "ProRes", "Apple ProRes, the standard mastering codec for "
+                             "editing. Falls back to H.264 on a Blender build "
+                             "without ProRes"),
+    )
+    videoCodecPref: EnumProperty(name="Codec", items=videoCodecContainer,
+                                 default='AUTO')
+
+    proresProfileContainer = (
+        ('422_LT',  "422 LT", "Smaller files, fine for draft reviews"),
+        ('422_STD', "422", "Standard quality, good balance of size and fidelity"),
+        ('422_HQ',  "422 HQ", "Highest 4:2:2 quality, for grading and VFX"),
+    )
+    proresProfile: EnumProperty(name="Profile", items=proresProfileContainer,
+                                default='422_HQ')
+
+    encodingSpeedContainer = (
+        ('REALTIME', "Fastest", "Quickest encode, larger file"),
+        ('GOOD',     "Balanced", "Blender's own default"),
+        ('BEST',     "Smallest File", "Slowest encode, best compression"),
+    )
+    encodingSpeed: EnumProperty(name="Encoding Speed",
+                                items=encodingSpeedContainer, default='REALTIME')
 
     # ---- Audio ----
     audioCodecContainer = (
@@ -1749,6 +1883,10 @@ class PlayblastSettingsGroup(PropertyGroup):
     # pb_show_* toggles are generated from DISPLAY_TOGGLES (see below).
 
     # ---- Stamps ----
+    useStamps: BoolProperty(
+        name="Burn-in Stamps", default=True,
+        description="Burn frame, date and the options below into the picture. "
+                    "Off gives clean frames, e.g. for a final")
     metadata_resolution: BoolProperty(name="Resolution", default=True)
     metadata_version: BoolProperty(
         name="Version", default=True,
@@ -1926,6 +2064,9 @@ def draw_summary(layout, settings, scene, icon='INFO'):
     else:
         col.label(text="View: current viewport", icon='VIEW3D')
     kind = info['container'] if info['video'] else ("%s sequence" % settings.imageEncoding)
+    if (info['video'] and info['container'] == 'QUICKTIME'
+            and getattr(settings, 'videoCodecPref', 'AUTO') == 'PRORES'):
+        kind = "QUICKTIME (ProRes %s)" % settings.proresProfile.replace('_', ' ')
     col.label(text="Output: %s" % kind)
     if info['eta'] is not None:
         col.label(text="Est. render: %s (last run)" % format_duration(info['eta']))
@@ -1971,6 +2112,13 @@ def draw_preset_row(layout, settings):
                           depress=(settings.preset_active == name))
         op.preset_name = name
 
+    info = PRESET_INFO.get(settings.preset_active)
+    if info:
+        col = layout.column(align=True)
+        col.active = False               # greyed: a caption, not a control
+        for line in info:
+            col.label(text=line)
+
 
 def _section_box(layout, label, icon='NONE'):
     """
@@ -2002,6 +2150,9 @@ def _section_resolution(layout, owner):
         col.prop(owner, "resolutionX")
         col.prop(owner, "resolutionY")
         layout.prop(owner, "resolution_percentage")
+    elif owner.resolutionMode == 'SCALE':
+        layout.prop(owner, "resolution_percentage", text="Scale")
+        layout.label(text="Scene resolution x scale", icon='INFO')
     else:
         layout.label(text="Uses the current scene resolution", icon='INFO')
 
@@ -2043,10 +2194,19 @@ def _section_output(layout, owner):
     _toggle_with_field(layout, owner, "autoVersion", "versionPadding", "Digits")
 
     layout.prop(owner, "outputEncoding", text="Format")
-    if owner.outputEncoding != 'IMAGE':
-        layout.prop(owner, "outputQuality")
-    else:
+    if owner.outputEncoding == 'IMAGE':
         layout.prop(owner, "imageEncoding")
+    else:
+        prores = False
+        if owner.outputEncoding == 'QUICKTIME':
+            layout.prop(owner, "videoCodecPref")
+            prores = owner.videoCodecPref == 'PRORES'
+            if prores:
+                layout.prop(owner, "proresProfile")
+        if not prores:
+            layout.prop(owner, "outputQuality")
+            if owner.outputEncoding in ('MPEG4', 'QUICKTIME', 'MKV'):
+                layout.prop(owner, "encodingSpeed", text="Speed")
     layout.prop(owner, "autoPlay")
 
     notice = output_directory_notice(owner)
@@ -2079,6 +2239,10 @@ def _audio_applies(owner):
 
 
 def _section_stamps(layout, owner):
+    layout.prop(owner, "useStamps")
+    if not owner.useStamps:
+        layout.label(text="Clean frames: nothing burned in", icon='INFO')
+        return
     layout.prop(owner, "metadata_resolution")
     if owner.saveOutputToFile and owner.autoVersion:
         layout.prop(owner, "metadata_version")
@@ -2352,11 +2516,20 @@ class PlayblastJob:
         if not ok:
             report(self.op, 'ERROR', message)
             return False
+        if (self.want_video and self.settings.outputEncoding == 'QUICKTIME'
+                and self.settings.videoCodecPref == 'PRORES'
+                and get_attr_safe(render.ffmpeg, "codec") != 'PRORES'):
+            report(self.op, 'INFO',
+                   "ProRes is not available in this Blender build - "
+                   "encoded as H.264 instead.")
         render.filepath = (movie_filepath(render, self.target_path)
                            if self.want_video else self.target_path)
         return True
 
     def _prepare_stamps(self):
+        if not self.settings.useStamps:
+            set_attr_safe(self.render, 'use_stamp', False)   # restored later
+            return True
         width, height = self.note_size
         note_text = build_stamp_note(self.settings, width, height,
                                      self.version if self.settings.autoVersion else 0)
@@ -2810,6 +2983,11 @@ class PlayblastPresetLoad(Operator):
 
     preset_name: StringProperty(name="Preset Name", default="")
 
+    @classmethod
+    def description(cls, context, properties):
+        info = PRESET_INFO.get(getattr(properties, "preset_name", ""))
+        return ". ".join(info) if info else cls.bl_description
+
     def execute(self, context):
         settings = context.scene.playblast_settings
         name = self.preset_name or settings.preset_active
@@ -2901,7 +3079,11 @@ class PlayblastMainPanel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        
+
+        # Three SEPARATE padded buttons (an unmerged column keeps a visible
+        # gap between them) at a sensible height - "just enough", matching the
+        # reference studio layout.  uiLayout scale is evaluated at DRAW time,
+        # so it is set once here and never reset.
         col = layout.column(align=False)
         col.scale_y = 1.8
         col.operator("my.playblast", text="", icon='RENDER_ANIMATION')
