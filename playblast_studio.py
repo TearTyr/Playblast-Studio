@@ -86,43 +86,20 @@ def get_default_temp_dir():
 #  every write is validated against the live RNA of the running build.
 # =========================================================================
 
-def enum_identifiers(rna_owner, prop_name):
-    """
-    Legal identifiers for an enum property, as reported by *this* build.
-
-    `rna_owner` must be an RNA instance so that context dependent enums - such
-    as `file_format`, filtered by `media_type` in 5.x - resolve correctly.
-    Returns an empty set when unknown; callers treat that as "try anyway".
-
-    NOTE: `prop.items` below is bpy_struct.items() (a method), so this always
-    raises and returns set(): assign_enum has effectively been "try anyway"
-    all along, and that is what keeps it working.  Do not "fix" this to
-    `enum_items` without testing on 5.x: for context-dependent enums such as
-    `file_format` the definition-level list is not filtered by media_type and
-    could wrongly reject a valid candidate.  (Presets use the correct
-    `enum_items` - see _enum_ids - because their enums are static.)
-    """
-    try:
-        prop = rna_owner.bl_rna.properties.get(prop_name)
-        if prop is None or getattr(prop, "type", None) != 'ENUM':
-            return set()
-        return {item.identifier for item in prop.items}
-    except Exception:
-        return set()
-
-
 def assign_enum(rna_owner, prop_name, candidates):
     """
     Assigns the first candidate this Blender accepts.  Returns the identifier
     applied, or None.  Never raises.
+
+    Candidates are simply tried: the RNA enum list is NOT consulted because
+    context-dependent enums such as `file_format` (filtered by `media_type` in
+    5.x) are not reliable at definition level.  (Presets use `enum_items` - see
+    _enum_ids - because their enums are static.)
     """
     if isinstance(candidates, str):
         candidates = (candidates,)
-    valid = enum_identifiers(rna_owner, prop_name)
     for candidate in candidates:
         if not candidate:
-            continue
-        if valid and candidate not in valid:
             continue
         try:
             setattr(rna_owner, prop_name, candidate)
@@ -272,7 +249,8 @@ def find_output_files(base_path, is_video):
         names = [e for e in entries if movie.match(e)
                  and movie.match(e).group(1).lower() in VIDEO_EXTENSIONS]
     else:
-        names = [e for e in entries if e.startswith(stem) and "." in e[len(stem):]]
+        names = [e for e in entries if e.startswith(stem)
+                 and os.path.splitext(e)[1].lower() in IMAGE_EXTENSIONS]
 
     paths = [os.path.join(directory, n) for n in names]
     paths = [p for p in paths if os.path.isfile(p)]
@@ -426,7 +404,7 @@ def _output_directory(settings):
             base = bpy.path.abspath(base)
         except Exception:
             base = os.path.abspath(base)
-    return os.path.expanduser(base)
+    return os.path.abspath(os.path.expanduser(base))
 
 
 def output_directory_notice(settings):
@@ -958,7 +936,7 @@ def get_safe_stamp_settings(render):
 def build_stamp_note(settings, width, height, version=0):
     """Assembles the multi-line stamp note burned into the render."""
     lines = ["Playblast | Blender {}".format(bpy.app.version_string)]
-    if version and getattr(settings, 'metadata_version', True):
+    if version and settings.metadata_version:
         lines.append("Version: v%0*d" % (int(settings.versionPadding), int(version)))
     if settings.metadata_resolution:
         lines.append("Resolution: {} x {} px".format(width, height))
@@ -1227,7 +1205,7 @@ MAX_HISTORY = 12
 _PRESET_BASE = {
     'saveOutputToFile': True,
     'useFrameStep': False, 'keyframesOnly': False,
-    'resolutionMode': 'SYNC',
+    'resolutionMode': 'SYNC', 'resolution_percentage': 100,
     'outputEncoding': 'MPEG4', 'videoCodecPref': 'AUTO',
     'outputQuality': 'HIGH', 'encodingSpeed': 'GOOD',
     'audioCodec': 'AAC',
@@ -2063,7 +2041,7 @@ def draw_summary(layout, settings, scene, icon='INFO'):
               icon=icon)
     col.label(text="%d x %d px   %s"
               % (info['width'], info['height'], format_duration(info['duration'])))
-    if getattr(settings, 'useCameraView', False) and getattr(scene, 'camera', None):
+    if settings.useCameraView and scene.camera:
         col.label(text="View: camera '%s'" % scene.camera.name, icon='CAMERA_DATA')
     else:
         col.label(text="View: current viewport", icon='VIEW3D')
