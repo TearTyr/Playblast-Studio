@@ -895,7 +895,7 @@ def apply_ffmpeg_settings_safe(render, settings):
     assign_enum(ffmpeg, "format", [container, 'MPEG4'])
     codec = None
     if (container == 'QUICKTIME'
-            and getattr(settings, 'videoCodecPref', 'AUTO') == 'PRORES'):
+            and settings.videoCodecPref == 'PRORES'):
         # Only where this build has ProRes; otherwise the normal H.264 path.
         codec = assign_enum(ffmpeg, "codec", ['PRORES'])
     if codec is None:
@@ -905,11 +905,11 @@ def apply_ffmpeg_settings_safe(render, settings):
 
     if codec == 'PRORES':
         assign_enum(ffmpeg, "ffmpeg_prores_profile",
-                    [getattr(settings, 'proresProfile', '422_HQ'),
+                    [settings.proresProfile,
                      '422_HQ', '422_STD'])
     elif codec in ('H264', 'H265'):
         assign_enum(ffmpeg, "ffmpeg_preset",
-                    [getattr(settings, 'encodingSpeed', 'REALTIME'),
+                    [settings.encodingSpeed,
                      'GOOD', 'REALTIME'])
 
     audio_codec = get_safe_audio_codec(ffmpeg, container, settings.audioCodec)
@@ -1300,7 +1300,7 @@ BOOKKEEPING_PROPS = frozenset((
 # edits them) but never written into a preset, so presets transfer between
 # machines and projects.  NOTE: do not put these in BOOKKEEPING_PROPS - that
 # would also drop them from MIRRORED_NAMES and break the settings panel.
-NON_PRESET_PROPS = frozenset(('outputFilePath',))
+NON_PRESET_PROPS = frozenset(('outputFilePath', 'frameRangeMode'))
 
 
 def is_preset_prop(name):
@@ -1478,7 +1478,7 @@ def load_preset(name, settings):
                 settings.extraInfo = badge
                 count += 1
         return True, "Applied the '%s' preset: %s." % (
-            name, "; ".join(PRESET_INFO.get(name, ())).lower() or
+            name, "; ".join(PRESET_INFO.get(name, ())) or
             "%d settings" % count)
     directory = preset_directory(create=False)
     path = os.path.join(directory, preset_file_stem(name) + ".json")
@@ -1959,6 +1959,10 @@ for _attr, _target, _props, _label, _default in DISPLAY_TOGGLES:
 MIRRORED_NAMES = tuple(name for name in PlayblastSettingsGroup.__annotations__
                        if name not in BOOKKEEPING_PROPS)
 
+# A misspelled preset key is skipped silently by dict_to_settings: fail loudly.
+assert all(k in PlayblastSettingsGroup.__annotations__
+           for p in BUILTIN_PRESETS.values() for k in p), 'bad BUILTIN_PRESETS key'
+
 
 def _plain_value(value):
     """bpy_prop_array -> tuple; everything else untouched."""
@@ -2065,7 +2069,7 @@ def draw_summary(layout, settings, scene, icon='INFO'):
         col.label(text="View: current viewport", icon='VIEW3D')
     kind = info['container'] if info['video'] else ("%s sequence" % settings.imageEncoding)
     if (info['video'] and info['container'] == 'QUICKTIME'
-            and getattr(settings, 'videoCodecPref', 'AUTO') == 'PRORES'):
+            and settings.videoCodecPref == 'PRORES'):
         kind = "QUICKTIME (ProRes %s)" % settings.proresProfile.replace('_', ' ')
     col.label(text="Output: %s" % kind)
     if info['eta'] is not None:
